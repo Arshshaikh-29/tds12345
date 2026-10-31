@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ga5-incident-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: INCIDENT_DB_PATH
+        value: /tmp/incidents_state.db
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_API_KEY
+        sync: false
