@@ -19,33 +19,27 @@ from fastapi.responses import JSONResponse
 # Configuration & Constants
 # ---------------------------------------------------------------------------
 SUPPORTED_PROFILE = "ga5-incident-agent/v2"
-DB_PATH = os.getenv("INCIDENT_DB_PATH", "incidents_state.db")
+DB_PATH = os.getenv("INCIDENT_DB_PATH", "/tmp/incidents_state.db")
 
-# Supports OpenAI, AIPipe, OpenRouter, Groq, or Gemini OpenAI-compatible endpoints
 LLM_API_KEY = (
-    os.getenv("OPENAI_API_KEY")
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
     or os.getenv("AIPIPE_TOKEN")
-    or os.getenv("GEMINI_API_KEY")
-    or os.getenv("GROQ_API_KEY")
+    or os.getenv("OPENROUTER_API_KEY")
     or ""
 )
+
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
 if not LLM_BASE_URL:
-    if os.getenv("AIPIPE_TOKEN") and not os.getenv("OPENAI_API_KEY"):
+    if os.getenv("AIPIPE_TOKEN") and not os.getenv("GEMINI_API_KEY"):
         LLM_BASE_URL = "https://aipipe.org/openai/v1"
-    elif os.getenv("GEMINI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-    elif os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY"):
-        LLM_BASE_URL = "https://api.groq.com/openai/v1"
+    elif os.getenv("OPENROUTER_API_KEY") and not os.getenv("GEMINI_API_KEY"):
+        LLM_BASE_URL = "https://openrouter.ai/api/v1"
     else:
-        LLM_BASE_URL = "https://api.openai.com/v1"
+        LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
-LLM_MODEL = os.getenv(
-    "LLM_MODEL",
-    "gemini-2.5-flash"
-    if "generativelanguage.googleapis.com" in LLM_BASE_URL
-    else "gpt-4o-mini",
-)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash")
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").lower()
 
 # Deterministic in-memory cache for transcript preprocessing across Check/Save runs
 PREPROCESS_CACHE: dict[str, list[tuple[str, str]]] = {}
@@ -79,6 +73,9 @@ SIGNAL_KEYWORDS = {
 # SQLite Persistence Layer
 # ---------------------------------------------------------------------------
 def init_db() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -307,11 +304,6 @@ def parse_and_preprocess_transcript(
     tool_catalog: list[dict[str, Any]],
     forbidden: list[str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """
-    Returns (all_evidence_lines, filtered_evidence_lines).
-    Deterministic preprocessing is cached by content hash so repeated Check/Save
-    runs with identical transcripts preprocess instantly.
-    """
     raw_transcript = str(incident.get("transcript") or "")
     for secret in forbidden:
         if secret and secret in raw_transcript:
@@ -339,7 +331,7 @@ def parse_and_preprocess_transcript(
     if cache_key in PREPROCESS_CACHE:
         return all_lines, PREPROCESS_CACHE[cache_key]
 
-    if len(all_lines) <= 90:
+    if len(all_lines) <= 160:
         cleaned = [
             (
                 ev_id,
@@ -350,7 +342,6 @@ def parse_and_preprocess_transcript(
         PREPROCESS_CACHE[cache_key] = cleaned
         return all_lines, cleaned
 
-    # Build domain vocabulary from incident metadata and tool catalog
     domain_terms: set[str] = set()
     for text_src in [
         str(incident.get("service") or ""),
@@ -367,7 +358,6 @@ def parse_and_preprocess_transcript(
         ):
             domain_terms.add(tok)
 
-    # Identify repetitive background log templates
     template_counts: dict[str, int] = {}
     line_templates: list[str] = []
     for _ev_id, txt in all_lines:
@@ -376,7 +366,7 @@ def parse_and_preprocess_transcript(
         template_counts[norm] = template_counts.get(norm, 0) + 1
 
     scored_indices: list[tuple[int, int]] = []
-    for idx, (ev_id, txt) in enumerate(all_lines):
+    for idx, (_ev_id, txt) in enumerate(all_lines):
         lower = txt.lower()
         words = set(re.findall(r"[a-z0-9_/-]{2,}", lower))
         score = 0
@@ -397,15 +387,13 @@ def parse_and_preprocess_transcript(
         if INJECTION_RE.search(txt):
             score -= 20
 
-        # Penalize repetitive noise templates
         if template_counts[line_templates[idx]] > 4 and score < 6:
             score -= 10
 
         scored_indices.append((score, idx))
 
-    # Keep top 95 lines by relevance score, then restore chronological order
     top_indices = sorted(
-        idx for _score, idx in sorted(scored_indices, key=lambda x: (-x[0], x[1]))[:95]
+        idx for _score, idx in sorted(scored_indices, key=lambda x: (-x[0], x[1]))[:160]
     )
     filtered = [
         (
@@ -433,7 +421,6 @@ def coerce_and_validate_arguments(
     additional_ok = input_schema.get("additionalProperties", True)
 
     out: dict[str, Any] = {}
-    # Case-insensitive key matching fallback
     lower_map = {k.lower(): v for k, v in raw_args.items()}
 
     for prop_name, prop_schema in props.items():
@@ -498,7 +485,7 @@ def coerce_and_validate_arguments(
 
 
 # ---------------------------------------------------------------------------
-# AI Model Planner + Heuristic Fallback
+# AI Model Planner (Gemini 3.5 Flash + Fallback Support)
 # ---------------------------------------------------------------------------
 def build_planner_prompt(
     incident: dict[str, Any],
@@ -524,8 +511,7 @@ def build_planner_prompt(
         '    {"toolName": "<diagnostic_tool_name>", "arguments": {...}, "evidence": ["<ev_id>"]}\n'
         "  ],\n"
         '  "effect": {\n'
-        '    "toolName": "<effect_tool_name>", "arguments": {...}, "evidence": ["<ev_id>"]\n'
-        "  }\n"
+        '    "toolName": "<effect_tool_name>", "arguments": {...}, "evidence": ["<ev_id>"]}\n'
         "}\n\n"
         "STRICT RULES:\n"
         "1. rootCause MUST be one exact value from allowedRootCauses.\n"
@@ -586,8 +572,10 @@ def heuristic_fallback_plan(
     chosen_diag = diag_tools[0] if diag_tools else tool_catalog[0]
     chosen_eff = eff_tools[0] if eff_tools else tool_catalog[-1]
 
-    # Check scaling limit rule in heuristic fallback
-    if any(w in full_text for w in ("scaling limit", "max replicas", "maximum replicas", "at limit", "at max")):
+    if any(
+        w in full_text
+        for w in ("scaling limit", "max replicas", "maximum replicas", "at limit", "at max")
+    ):
         for et in eff_tools:
             if any(k in et.get("name", "").lower() for k in ("page", "owner", "notify", "escalat")):
                 chosen_eff = et
@@ -652,12 +640,15 @@ def sanitize_and_validate_plan(
         if (not valid_ev_ids or s_eid in valid_ev_ids) and s_eid not in diag_ev:
             diag_ev.append(s_eid)
 
-    # Also harvest any valid evidence IDs cited inside diagnostics/effect if needed
     for item in (raw_plan.get("diagnostics") or []) + [raw_plan.get("effect") or {}]:
         if isinstance(item, dict):
             for eid in item.get("evidence") or []:
                 s_eid = str(eid).strip().strip("[]")
-                if (not valid_ev_ids or s_eid in valid_ev_ids) and s_eid not in diag_ev and len(diag_ev) < 4:
+                if (
+                    (not valid_ev_ids or s_eid in valid_ev_ids)
+                    and s_eid not in diag_ev
+                    and len(diag_ev) < 4
+                ):
                     diag_ev.append(s_eid)
 
     for fallback_eid in ordered_ev_ids:
@@ -773,47 +764,128 @@ async def plan_incident(
     model_used = LLM_MODEL
     raw_plan: Optional[dict[str, Any]] = None
 
+    def _extract_json(text: str) -> Optional[dict[str, Any]]:
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.DOTALL)
+        m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        return json.loads(m.group(0)) if m else None
+
     if LLM_API_KEY:
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload: dict[str, Any] = {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": usr_prompt},
-            ],
-            "temperature": 0.0,
-            "response_format": {"type": "json_object"},
-        }
-        try:
-            resp = await http_client.post(
-                f"{LLM_BASE_URL}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=14.0,
-            )
-            if resp.status_code != 200:
-                # Fallback without response_format if provider rejects it
-                payload.pop("response_format", None)
-                resp = await http_client.post(
-                    f"{LLM_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=14.0,
+        is_google_direct = "generativelanguage.googleapis.com" in LLM_BASE_URL
+        candidate_models = [LLM_MODEL]
+        for fallback_m in ("gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.0-flash"):
+            if fallback_m not in candidate_models and "gemini" in LLM_MODEL.lower():
+                candidate_models.append(fallback_m)
+
+        # 1. Native Google Gemini v1beta generateContent endpoint
+        if is_google_direct:
+            for candidate_model in candidate_models:
+                bare_model = candidate_model.split("/")[-1]
+                is_gemini_3 = "gemini-3" in bare_model.lower()
+                native_url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{bare_model}:generateContent"
                 )
-            resp.raise_for_status()
-            data = resp.json()
-            model_used = str(data.get("model") or LLM_MODEL)
-            content = data["choices"][0]["message"]["content"]
-            if isinstance(content, str):
-                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.DOTALL)
-                m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-                if m:
-                    raw_plan = json.loads(m.group(0))
-        except Exception:
-            raw_plan = None
+                gen_config: dict[str, Any] = {
+                    "responseMimeType": "application/json",
+                }
+                if is_gemini_3:
+                    gen_config["thinkingConfig"] = {
+                        "thinkingLevel": GEMINI_THINKING_LEVEL.upper()
+                    }
+
+                native_payload = {
+                    "systemInstruction": {"parts": [{"text": sys_prompt}]},
+                    "contents": [{"role": "user", "parts": [{"text": usr_prompt}]}],
+                    "generationConfig": gen_config,
+                }
+                try:
+                    resp = await http_client.post(
+                        native_url,
+                        headers={
+                            "x-goog-api-key": LLM_API_KEY,
+                            "Content-Type": "application/json",
+                        },
+                        json=native_payload,
+                        timeout=13.5,
+                    )
+                    if resp.status_code != 200 and "thinkingConfig" in gen_config:
+                        gen_config.pop("thinkingConfig", None)
+                        resp = await http_client.post(
+                            native_url,
+                            headers={
+                                "x-goog-api-key": LLM_API_KEY,
+                                "Content-Type": "application/json",
+                            },
+                            json=native_payload,
+                            timeout=13.5,
+                        )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        model_used = str(data.get("modelVersion") or bare_model)
+                        parts = (
+                            data.get("candidates", [{}])[0]
+                            .get("content", {})
+                            .get("parts", [])
+                        )
+                        text_chunks = [
+                            p["text"]
+                            for p in parts
+                            if isinstance(p, dict) and "text" in p and not p.get("thought")
+                        ]
+                        if text_chunks:
+                            raw_plan = _extract_json("\n".join(text_chunks))
+                            if isinstance(raw_plan, dict):
+                                break
+                except Exception:
+                    continue
+
+        # 2. OpenAI-compatible /chat/completions endpoint (OpenRouter, AIPipe, or Google OpenAI compat)
+        if raw_plan is None:
+            headers = {
+                "Authorization": f"Bearer {LLM_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            for candidate_model in candidate_models:
+                is_gemini_3 = "gemini-3" in candidate_model.lower()
+                payload: dict[str, Any] = {
+                    "model": candidate_model,
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                }
+                if is_gemini_3:
+                    payload["reasoning_effort"] = GEMINI_THINKING_LEVEL
+                else:
+                    payload["temperature"] = 0.0
+
+                try:
+                    resp = await http_client.post(
+                        f"{LLM_BASE_URL}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                        timeout=13.5,
+                    )
+                    if resp.status_code != 200:
+                        payload.pop("reasoning_effort", None)
+                        payload.pop("response_format", None)
+                        resp = await http_client.post(
+                            f"{LLM_BASE_URL}/chat/completions",
+                            headers=headers,
+                            json=payload,
+                            timeout=13.5,
+                        )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        model_used = str(data.get("model") or candidate_model)
+                        content = data["choices"][0]["message"]["content"]
+                        if isinstance(content, str):
+                            raw_plan = _extract_json(content)
+                            if isinstance(raw_plan, dict):
+                                break
+                except Exception:
+                    continue
 
     end_ns = max(now_ns(), start_ns + 1_000_000)
 
@@ -905,7 +977,7 @@ def build_otlp_trace(internal: dict[str, Any], forbidden: list[str]) -> dict[str
         "attributes": base_attrs
         + [
             attr_str("gen_ai.operation.name", "chat"),
-            attr_str("gen_ai.request.model", internal["chatModel"] or "gpt-4o-mini"),
+            attr_str("gen_ai.request.model", internal["chatModel"] or LLM_MODEL),
         ],
         "status": {"code": 1},
     }
@@ -1131,7 +1203,6 @@ app = FastAPI(title="GA5 Observable Incident Agent", version="2.0.0", lifespan=l
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_request: Request, _exc: RequestValidationError):
-    # Never echo request input or sensitive fields in validation errors
     return JSONResponse(
         status_code=422,
         content={"error": "invalid_request", "message": "Request validation failed."},
@@ -1218,7 +1289,6 @@ async def create_or_replay_incident(request: Request):
         agent_span_id = new_hex_id(8, used_span_ids)
         chat_span_id = new_hex_id(8, used_span_ids)
 
-        # Run model planner (never passes `sensitive`)
         plan, chat_start_ns, chat_end_ns, chat_model = await plan_incident(
             request.app.state.http_client,
             incident,
@@ -1458,7 +1528,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                 seen_in_batch.add(key)
                 validated_outcomes.append(item)
 
-            # Apply validated outcomes
             retry_dispatches: list[dict[str, Any]] = []
             resolved_keys: set[tuple[str, str, int]] = set()
 
@@ -1487,7 +1556,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                 receipt_entry["nonce"] = nonce
                 internal["receiptLog"].append(receipt_entry)
 
-                # Locate logical action record
                 action_rec = next(
                     a for a in internal["executedActions"] if a["actionId"] == act_id
                 )
@@ -1501,7 +1569,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                 action_rec["endNs"] = end_t
 
                 if status_val == 503 and att == 1:
-                    # Exactly one retry allowed on 503
                     new_client_span_id = new_hex_id(8, used_span_ids)
                     retry_start_ns = end_t + 200_000
                     action_rec["attempts"].append(
@@ -1546,9 +1613,7 @@ async def process_or_replay_receipt(runId: str, request: Request):
             ] + retry_dispatches
             internal["pendingDispatches"] = remaining_pending
 
-            # If there are still pending or retrying calls in this phase, return waiting
             if remaining_pending:
-                # Note: A retry response must not contain an approval request
                 resp_payload = scrub_sensitive(
                     {
                         "runId": runId,
@@ -1566,14 +1631,12 @@ async def process_or_replay_receipt(runId: str, request: Request):
                 )
                 return JSONResponse(status_code=200, content=resp_payload)
 
-            # All dispatches in current phase have completed
             if internal["phase"] == "diagnostic":
                 diag_actions = [
                     a for a in internal["executedActions"] if a["phase"] == "diagnostic"
                 ]
                 max_diag_end_ns = max(a["endNs"] for a in diag_actions)
 
-                # Create incident.join span if diagnostics fanned out (> 1)
                 if len(diag_actions) > 1 and internal["joinSpan"] is None:
                     join_span_id = new_hex_id(8, used_span_ids)
                     join_start_ns = max(now_ns(), max_diag_end_ns + 100_000)
@@ -1585,7 +1648,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                         "linkedExecSpanIds": [a["execSpanId"] for a in diag_actions],
                     }
 
-                # Check if any diagnostic failed or timed out
                 if any(a["finalStatus"] != 200 for a in diag_actions):
                     planned_eff_name = internal["plannedEffect"]["toolName"]
                     internal["usedSpanIds"] = list(used_span_ids)
@@ -1601,7 +1663,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                     )
                     return JSONResponse(status_code=200, content=final_resp)
 
-                # Diagnostics succeeded -> check if planned effect requires approval
                 planned_eff = internal["plannedEffect"]
                 eff_tool_name = planned_eff["toolName"]
                 approval_required_list = internal["policy"].get("approvalRequiredFor") or []
@@ -1638,7 +1699,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                     )
                     return JSONResponse(status_code=200, content=resp_payload)
 
-                # Effect does not require approval -> dispatch immediately
                 internal["phase"] = "effect"
                 eff_exec_span_id = new_hex_id(8, used_span_ids)
                 eff_client_span_id = new_hex_id(8, used_span_ids)
@@ -1704,7 +1764,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
                 )
                 return JSONResponse(status_code=200, content=resp_payload)
 
-            # Effect phase completed
             eff_actions = [a for a in internal["executedActions"] if a["phase"] == "effect"]
             eff_action = eff_actions[-1]
             internal["usedSpanIds"] = list(used_span_ids)
@@ -1795,7 +1854,6 @@ async def process_or_replay_receipt(runId: str, request: Request):
             )
             return JSONResponse(status_code=200, content=final_resp)
 
-        # Approved -> dispatch reserved effect with approvalId and approvalNonce
         internal["phase"] = "effect"
         planned_eff["approvalNonce"] = nonce
         eff_exec_span_id = new_hex_id(8, used_span_ids)
