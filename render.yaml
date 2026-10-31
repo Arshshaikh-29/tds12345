@@ -12,6 +12,8 @@ services:
       - key: INCIDENT_DB_PATH
         value: /tmp/incidents_state.db
       - key: LLM_MODEL
-        value: gpt-4o-mini
-      - key: OPENAI_API_KEY
+        value: gemini-3.5-flash
+      - key: GEMINI_THINKING_LEVEL
+        value: low
+      - key: GEMINI_API_KEY
         sync: false
